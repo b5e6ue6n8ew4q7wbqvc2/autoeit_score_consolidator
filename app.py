@@ -1,6 +1,5 @@
 import io
 import zipfile
-import re
 import pandas as pd
 import streamlit as st
 
@@ -185,7 +184,7 @@ def consolidate(bio_df: pd.DataFrame, subs_df: pd.DataFrame):
 
 
 # ---------------------------------------------------------------------------
-# Build output zip in memory
+# Build output CSV zip in memory
 # ---------------------------------------------------------------------------
 def build_output_zip(bio_df: pd.DataFrame, subs_df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
@@ -194,6 +193,39 @@ def build_output_zip(bio_df: pd.DataFrame, subs_df: pd.DataFrame) -> bytes:
         zf.writestr("submissions.csv", subs_df.to_csv(index=False))
     buf.seek(0)
     return buf.read()
+
+
+# ---------------------------------------------------------------------------
+# Build consolidated audio zip in memory
+# ---------------------------------------------------------------------------
+def build_output_audio_zip(
+    audio_zip_bytes: bytes,
+    consolidated_subs_df: pd.DataFrame,
+) -> tuple[bytes, list[str]]:
+    """
+    Copy only the audio files referenced in consolidated_subs_df into a new zip.
+
+    Returns
+    -------
+    zip_bytes : bytes       – the consolidated audio zip
+    missing   : list[str]  – filenames that were expected but absent from the input zip
+    """
+    keep = set(consolidated_subs_df["audio_file_name"].dropna())
+
+    buf = io.BytesIO()
+    missing: list[str] = []
+
+    with zipfile.ZipFile(io.BytesIO(audio_zip_bytes)) as src_zf:
+        available = set(src_zf.namelist())
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as dst_zf:
+            for fname in keep:
+                if fname in available:
+                    dst_zf.writestr(fname, src_zf.read(fname))
+                else:
+                    missing.append(fname)
+
+    buf.seek(0)
+    return buf.read(), missing
 
 
 # ---------------------------------------------------------------------------
@@ -209,30 +241,37 @@ def output_zip_name(uploaded_name: str) -> str:
 # ---------------------------------------------------------------------------
 # Main UI
 # ---------------------------------------------------------------------------
-uploaded = st.file_uploader(
-    "Upload your AutoEIT export zip",
+uploaded_csv = st.file_uploader(
+    "Upload your AutoEIT CSV export zip",
     type="zip",
     help="The zip must contain bio.csv and submissions.csv.",
 )
 
-if uploaded is not None:
-    # --- Validate zip contents ----------------------------------------------
+uploaded_audio = st.file_uploader(
+    "Upload your AutoEIT audio export zip (optional)",
+    type="zip",
+    help="The zip should contain the MP3 files exported from AutoEIT. "
+         "When provided, a consolidated audio zip will be produced alongside the CSV zip.",
+)
+
+if uploaded_csv is not None:
+    # --- Validate CSV zip contents ------------------------------------------
     bio_raw = None
     subs_raw = None
     try:
-        with zipfile.ZipFile(io.BytesIO(uploaded.read())) as zf:
+        with zipfile.ZipFile(io.BytesIO(uploaded_csv.read())) as zf:
             names = zf.namelist()
-            missing = [f for f in ("bio.csv", "submissions.csv") if f not in names]
-            if missing:
+            missing_files = [f for f in ("bio.csv", "submissions.csv") if f not in names]
+            if missing_files:
                 st.error(
                     f"The zip is missing the following required file(s): "
-                    f"{', '.join(missing)}"
+                    f"{', '.join(missing_files)}"
                 )
                 st.stop()
             bio_raw = pd.read_csv(zf.open("bio.csv"))
             subs_raw = pd.read_csv(zf.open("submissions.csv"))
     except zipfile.BadZipFile:
-        st.error("The uploaded file does not appear to be a valid zip archive.")
+        st.error("The uploaded CSV file does not appear to be a valid zip archive.")
         st.stop()
 
     if bio_raw is None or subs_raw is None:
@@ -281,12 +320,43 @@ if uploaded is not None:
 
     # --- Download -----------------------------------------------------------
     st.subheader("Download")
-    out_zip_bytes = build_output_zip(consolidated_bio, consolidated_subs)
-    out_name = output_zip_name(uploaded.name)
 
+    # CSV zip (always available)
+    out_csv_bytes = build_output_zip(consolidated_bio, consolidated_subs)
+    out_csv_name = output_zip_name(uploaded_csv.name)
     st.download_button(
-        label=f"Download {out_name}",
-        data=out_zip_bytes,
-        file_name=out_name,
+        label=f"Download {out_csv_name}",
+        data=out_csv_bytes,
+        file_name=out_csv_name,
         mime="application/zip",
     )
+
+    # Audio zip (only when an audio zip was uploaded)
+    if uploaded_audio is not None:
+        try:
+            audio_raw_bytes = uploaded_audio.read()
+            # Validate it is a zip before processing
+            if not zipfile.is_zipfile(io.BytesIO(audio_raw_bytes)):
+                st.error("The uploaded audio file does not appear to be a valid zip archive.")
+            else:
+                with st.spinner("Consolidating audio files…"):
+                    out_audio_bytes, missing_audio = build_output_audio_zip(
+                        audio_raw_bytes, consolidated_subs
+                    )
+
+                if missing_audio:
+                    st.warning(
+                        f"{len(missing_audio)} audio file(s) listed in submissions.csv were not "
+                        f"found in the audio zip and have been omitted from the output:\n"
+                        + "\n".join(f"- {f}" for f in sorted(missing_audio))
+                    )
+
+                out_audio_name = output_zip_name(uploaded_audio.name)
+                st.download_button(
+                    label=f"Download {out_audio_name}",
+                    data=out_audio_bytes,
+                    file_name=out_audio_name,
+                    mime="application/zip",
+                )
+        except zipfile.BadZipFile:
+            st.error("The uploaded audio file does not appear to be a valid zip archive.")
