@@ -20,6 +20,41 @@ st.caption(
 )
 
 # ---------------------------------------------------------------------------
+# ZIP type detection
+# Mirrors the logic in combine_zips_v2.py:
+#   - AUDIO_CSV: contains bio.csv + submissions.csv + .mp3 files
+#   - CSV_ONLY:  contains bio.csv + submissions.csv (no .mp3 files)
+#   - AUDIO_ONLY: contains .mp3 files but no bio.csv / submissions.csv
+#   - UNKNOWN: none of the above
+# ---------------------------------------------------------------------------
+ZIP_TYPE_AUDIO_CSV = "AUDIO_CSV"
+ZIP_TYPE_CSV_ONLY  = "CSV_ONLY"
+ZIP_TYPE_AUDIO_ONLY = "AUDIO_ONLY"
+ZIP_TYPE_UNKNOWN   = "UNKNOWN"
+
+
+def detect_zip_type(zip_bytes: bytes) -> str:
+    """Inspect ZIP contents and return one of the ZIP_TYPE_* constants."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            names = set(zf.namelist())
+    except zipfile.BadZipFile:
+        return ZIP_TYPE_UNKNOWN
+
+    has_bio  = "bio.csv" in names
+    has_subs = "submissions.csv" in names
+    has_mp3  = any(n.lower().endswith(".mp3") for n in names)
+
+    if has_bio and has_subs and has_mp3:
+        return ZIP_TYPE_AUDIO_CSV
+    if has_bio and has_subs:
+        return ZIP_TYPE_CSV_ONLY
+    if has_mp3:
+        return ZIP_TYPE_AUDIO_ONLY
+    return ZIP_TYPE_UNKNOWN
+
+
+# ---------------------------------------------------------------------------
 # Helper: extract session ID from audio_file_name
 # e.g. "BVQEA-2026111078-683-1.mp3"  →  683
 # ---------------------------------------------------------------------------
@@ -187,10 +222,11 @@ def consolidate(bio_df: pd.DataFrame, subs_df: pd.DataFrame):
 # Build output CSV zip in memory
 # ---------------------------------------------------------------------------
 def build_output_zip(bio_df: pd.DataFrame, subs_df: pd.DataFrame) -> bytes:
+    """Write bio.csv and submissions.csv into an in-memory zip and return the bytes."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("bio.csv", bio_df.to_csv(index=False))
-        zf.writestr("submissions.csv", subs_df.to_csv(index=False))
+        zf.writestr("bio.csv", bio_df.fillna("").to_csv(index=False, encoding="utf-8-sig"))
+        zf.writestr("submissions.csv", subs_df.fillna("").to_csv(index=False, encoding="utf-8-sig"))
     buf.seek(0)
     return buf.read()
 
@@ -230,36 +266,131 @@ def build_output_audio_zip(
 
 # ---------------------------------------------------------------------------
 # Derive output zip filename from uploaded filename
+# Mirrors the input suffix:
+#   foo_AUDIO_CSV.zip         → foo_AUDIO_CSV_consolidated.zip
+#   foo_AUDIO_CSV_consolidated.zip  → foo_AUDIO_CSV_consolidated.zip  (idempotent)
+#   foo_CSV.zip               → foo_CSV_consolidated.zip
+#   foo_Audio.zip             → foo_Audio_consolidated.zip
+#   foo.zip                   → foo_consolidated.zip
 # ---------------------------------------------------------------------------
 def output_zip_name(uploaded_name: str) -> str:
+    """Derive the consolidated output filename from the uploaded filename."""
     stem = uploaded_name
     if stem.lower().endswith(".zip"):
         stem = stem[:-4]
+    # Already consolidated — return as-is (idempotent)
+    if stem.lower().endswith("_consolidated"):
+        return f"{stem}.zip"
+    return f"{stem}_consolidated.zip"
+
+
+def audio_output_zip_name(uploaded_name: str) -> str:
+    """
+    Derive the audio output filename for an AUDIO_CSV zip.
+    e.g. A1_Red_AOPEB_AUDIO_CSV.zip → A1_Red_AOPEB_Audio_consolidated.zip
+    """
+    stem = uploaded_name
+    if stem.lower().endswith(".zip"):
+        stem = stem[:-4]
+    if stem.lower().endswith("_consolidated"):
+        stem = stem[:-13]  # strip _consolidated before re-adding
+    # Replace _AUDIO_CSV suffix (case-insensitive) with _Audio
+    import re
+    stem = re.sub(r"_AUDIO_CSV$", "_Audio", stem, flags=re.IGNORECASE)
     return f"{stem}_consolidated.zip"
 
 
 # ---------------------------------------------------------------------------
 # Main UI
 # ---------------------------------------------------------------------------
-uploaded_csv = st.file_uploader(
-    "Upload your AutoEIT CSV export zip",
+uploaded_file = st.file_uploader(
+    "Upload your AutoEIT export zip",
     type="zip",
-    help="The zip must contain bio.csv and submissions.csv.",
+    help=(
+        "Drag and drop or click to upload. Accepts:\n"
+        "- **AUDIO_CSV zip** (bio.csv + submissions.csv + MP3s — current platform format)\n"
+        "- **CSV-only zip** (bio.csv + submissions.csv)\n"
+        "- **Audio-only zip** (MP3s only — for use with a separately uploaded CSV zip)\n\n"
+        "The zip type is detected automatically from its contents."
+    ),
 )
 
-uploaded_audio = st.file_uploader(
-    "Upload your AutoEIT audio export zip (optional)",
-    type="zip",
-    help="The zip should contain the MP3 files exported from AutoEIT. "
-         "When provided, a consolidated audio zip will be produced alongside the CSV zip.",
-)
+# Second uploader — only shown when user uploads an audio-only zip, or a
+# CSV-only zip without audio.  Hidden when an AUDIO_CSV zip is uploaded.
+uploaded_secondary = None
 
-if uploaded_csv is not None:
-    # --- Validate CSV zip contents ------------------------------------------
-    bio_raw = None
+if uploaded_file is not None:
+    primary_bytes = uploaded_file.read()
+    zip_type = detect_zip_type(primary_bytes)
+
+    if zip_type == ZIP_TYPE_AUDIO_CSV:
+        st.info("Detected: combined Audio + CSV zip (AUDIO_CSV format).", icon="ℹ️")
+
+    elif zip_type == ZIP_TYPE_CSV_ONLY:
+        st.info("Detected: CSV-only zip.", icon="ℹ️")
+        uploaded_secondary = st.file_uploader(
+            "Upload matching audio zip (optional)",
+            type="zip",
+            help="If you have a separate audio zip for this export, upload it here "
+                 "to also receive a consolidated audio zip.",
+            key="secondary_audio",
+        )
+
+    elif zip_type == ZIP_TYPE_AUDIO_ONLY:
+        st.info("Detected: audio-only zip.", icon="ℹ️")
+        uploaded_secondary = st.file_uploader(
+            "Upload matching CSV zip (required)",
+            type="zip",
+            help="The uploaded file contains only audio. Upload the matching CSV zip "
+                 "(with bio.csv and submissions.csv) to process scores.",
+            key="secondary_csv",
+        )
+
+    elif zip_type == ZIP_TYPE_UNKNOWN:
+        st.error(
+            "Could not determine the zip type. The file must contain bio.csv and "
+            "submissions.csv (for CSV processing) and/or .mp3 files (for audio)."
+        )
+        st.stop()
+
+# ---------------------------------------------------------------------------
+# Resolve which bytes are the CSV source and which are the audio source
+# ---------------------------------------------------------------------------
+csv_zip_bytes   = None
+csv_zip_name    = None
+audio_zip_bytes = None
+audio_zip_name  = None
+
+if uploaded_file is not None:
+    if zip_type == ZIP_TYPE_AUDIO_CSV:
+        csv_zip_bytes = primary_bytes
+        csv_zip_name  = uploaded_file.name
+        audio_zip_bytes = primary_bytes       # same zip — MP3s extracted from it
+        audio_zip_name  = uploaded_file.name
+
+    elif zip_type == ZIP_TYPE_CSV_ONLY:
+        csv_zip_bytes = primary_bytes
+        csv_zip_name  = uploaded_file.name
+        if uploaded_secondary is not None:
+            audio_zip_bytes = uploaded_secondary.read()
+            audio_zip_name  = uploaded_secondary.name
+
+    elif zip_type == ZIP_TYPE_AUDIO_ONLY:
+        audio_zip_bytes = primary_bytes
+        audio_zip_name  = uploaded_file.name
+        if uploaded_secondary is not None:
+            csv_zip_bytes = uploaded_secondary.read()
+            csv_zip_name  = uploaded_secondary.name
+
+# ---------------------------------------------------------------------------
+# Process when we have CSV data
+# ---------------------------------------------------------------------------
+if csv_zip_bytes is not None:
+    # --- Read CSVs from the zip ---------------------------------------------
+    bio_raw  = None
     subs_raw = None
     try:
-        with zipfile.ZipFile(io.BytesIO(uploaded_csv.read())) as zf:
+        with zipfile.ZipFile(io.BytesIO(csv_zip_bytes)) as zf:
             names = zf.namelist()
             missing_files = [f for f in ("bio.csv", "submissions.csv") if f not in names]
             if missing_files:
@@ -268,10 +399,10 @@ if uploaded_csv is not None:
                     f"{', '.join(missing_files)}"
                 )
                 st.stop()
-            bio_raw = pd.read_csv(zf.open("bio.csv"))
-            subs_raw = pd.read_csv(zf.open("submissions.csv"))
+            bio_raw  = pd.read_csv(zf.open("bio.csv"),          dtype={"submitter_id": str})
+            subs_raw = pd.read_csv(zf.open("submissions.csv"),  dtype={"submitter_id": str})
     except zipfile.BadZipFile:
-        st.error("The uploaded CSV file does not appear to be a valid zip archive.")
+        st.error("The uploaded file does not appear to be a valid zip archive.")
         st.stop()
 
     if bio_raw is None or subs_raw is None:
@@ -318,12 +449,12 @@ if uploaded_csv is not None:
         column_order=["Submitter ID", "Name", "Sessions found", "Items in output", "Status"],
     )
 
-    # --- Download -----------------------------------------------------------
+    # --- Downloads -----------------------------------------------------------
     st.subheader("Download")
 
-    # CSV zip (always available)
+    # CSV zip (always available when CSV data was processed)
     out_csv_bytes = build_output_zip(consolidated_bio, consolidated_subs)
-    out_csv_name = output_zip_name(uploaded_csv.name)
+    out_csv_name  = output_zip_name(csv_zip_name)
     st.download_button(
         label=f"Download {out_csv_name}",
         data=out_csv_bytes,
@@ -331,17 +462,15 @@ if uploaded_csv is not None:
         mime="application/zip",
     )
 
-    # Audio zip (only when an audio zip was uploaded)
-    if uploaded_audio is not None:
+    # Audio zip
+    if audio_zip_bytes is not None:
         try:
-            audio_raw_bytes = uploaded_audio.read()
-            # Validate it is a zip before processing
-            if not zipfile.is_zipfile(io.BytesIO(audio_raw_bytes)):
-                st.error("The uploaded audio file does not appear to be a valid zip archive.")
+            if not zipfile.is_zipfile(io.BytesIO(audio_zip_bytes)):
+                st.error("The audio source does not appear to be a valid zip archive.")
             else:
                 with st.spinner("Consolidating audio files…"):
                     out_audio_bytes, missing_audio = build_output_audio_zip(
-                        audio_raw_bytes, consolidated_subs
+                        audio_zip_bytes, consolidated_subs
                     )
 
                 if missing_audio:
@@ -351,7 +480,12 @@ if uploaded_csv is not None:
                         + "\n".join(f"- {f}" for f in sorted(missing_audio))
                     )
 
-                out_audio_name = output_zip_name(uploaded_audio.name)
+                # Name the audio output zip
+                if zip_type == ZIP_TYPE_AUDIO_CSV:
+                    out_audio_name = audio_output_zip_name(audio_zip_name)
+                else:
+                    out_audio_name = output_zip_name(audio_zip_name)
+
                 st.download_button(
                     label=f"Download {out_audio_name}",
                     data=out_audio_bytes,
@@ -359,4 +493,4 @@ if uploaded_csv is not None:
                     mime="application/zip",
                 )
         except zipfile.BadZipFile:
-            st.error("The uploaded audio file does not appear to be a valid zip archive.")
+            st.error("The audio source does not appear to be a valid zip archive.")
