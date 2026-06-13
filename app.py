@@ -232,7 +232,44 @@ def build_output_zip(bio_df: pd.DataFrame, subs_df: pd.DataFrame) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Build consolidated audio zip in memory
+# Build consolidated AUDIO_CSV zip in memory (mirrors single-zip input)
+# ---------------------------------------------------------------------------
+def build_output_audio_csv_zip(
+    source_zip_bytes: bytes,
+    bio_df: pd.DataFrame,
+    subs_df: pd.DataFrame,
+    consolidated_subs_df: pd.DataFrame,
+) -> tuple[bytes, list[str]]:
+    """
+    Build a single consolidated AUDIO_CSV zip containing bio.csv,
+    submissions.csv, and only the MP3s referenced in consolidated_subs_df.
+
+    Returns
+    -------
+    zip_bytes : bytes       – the consolidated AUDIO_CSV zip
+    missing   : list[str]  – MP3 filenames expected but absent from the source zip
+    """
+    keep = set(consolidated_subs_df["audio_file_name"].dropna())
+    missing: list[str] = []
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(source_zip_bytes)) as src_zf:
+        available = set(src_zf.namelist())
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as dst_zf:
+            dst_zf.writestr("bio.csv", bio_df.fillna("").to_csv(index=False, encoding="utf-8-sig"))
+            dst_zf.writestr("submissions.csv", subs_df.fillna("").to_csv(index=False, encoding="utf-8-sig"))
+            for fname in keep:
+                if fname in available:
+                    dst_zf.writestr(fname, src_zf.read(fname))
+                else:
+                    missing.append(fname)
+
+    buf.seek(0)
+    return buf.read(), missing
+
+
+# ---------------------------------------------------------------------------
+# Build consolidated audio-only zip in memory
 # ---------------------------------------------------------------------------
 def build_output_audio_zip(
     audio_zip_bytes: bytes,
@@ -283,21 +320,6 @@ def output_zip_name(uploaded_name: str) -> str:
         return f"{stem}.zip"
     return f"{stem}_consolidated.zip"
 
-
-def audio_output_zip_name(uploaded_name: str) -> str:
-    """
-    Derive the audio output filename for an AUDIO_CSV zip.
-    e.g. A1_Red_AOPEB_AUDIO_CSV.zip → A1_Red_AOPEB_Audio_consolidated.zip
-    """
-    stem = uploaded_name
-    if stem.lower().endswith(".zip"):
-        stem = stem[:-4]
-    if stem.lower().endswith("_consolidated"):
-        stem = stem[:-13]  # strip _consolidated before re-adding
-    # Replace _AUDIO_CSV suffix (case-insensitive) with _Audio
-    import re
-    stem = re.sub(r"_AUDIO_CSV$", "_Audio", stem, flags=re.IGNORECASE)
-    return f"{stem}_consolidated.zip"
 
 
 # ---------------------------------------------------------------------------
@@ -452,45 +474,65 @@ if csv_zip_bytes is not None:
     # --- Downloads -----------------------------------------------------------
     st.subheader("Download")
 
-    # CSV zip (always available when CSV data was processed)
-    out_csv_bytes = build_output_zip(consolidated_bio, consolidated_subs)
-    out_csv_name  = output_zip_name(csv_zip_name)
-    st.download_button(
-        label=f"Download {out_csv_name}",
-        data=out_csv_bytes,
-        file_name=out_csv_name,
-        mime="application/zip",
-    )
-
-    # Audio zip
-    if audio_zip_bytes is not None:
+    if zip_type == ZIP_TYPE_AUDIO_CSV:
+        # Single combined output zip mirrors the single combined input zip
         try:
-            if not zipfile.is_zipfile(io.BytesIO(audio_zip_bytes)):
-                st.error("The audio source does not appear to be a valid zip archive.")
-            else:
-                with st.spinner("Consolidating audio files…"):
-                    out_audio_bytes, missing_audio = build_output_audio_zip(
-                        audio_zip_bytes, consolidated_subs
-                    )
-
-                if missing_audio:
-                    st.warning(
-                        f"{len(missing_audio)} audio file(s) listed in submissions.csv were not "
-                        f"found in the audio zip and have been omitted from the output:\n"
-                        + "\n".join(f"- {f}" for f in sorted(missing_audio))
-                    )
-
-                # Name the audio output zip
-                if zip_type == ZIP_TYPE_AUDIO_CSV:
-                    out_audio_name = audio_output_zip_name(audio_zip_name)
-                else:
-                    out_audio_name = output_zip_name(audio_zip_name)
-
-                st.download_button(
-                    label=f"Download {out_audio_name}",
-                    data=out_audio_bytes,
-                    file_name=out_audio_name,
-                    mime="application/zip",
+            with st.spinner("Building output zip…"):
+                out_bytes, missing_audio = build_output_audio_csv_zip(
+                    audio_zip_bytes, consolidated_bio, consolidated_subs, consolidated_subs
                 )
+
+            if missing_audio:
+                st.warning(
+                    f"{len(missing_audio)} audio file(s) listed in submissions.csv were not "
+                    f"found in the source zip and have been omitted from the output:\n"
+                    + "\n".join(f"- {f}" for f in sorted(missing_audio))
+                )
+
+            out_name = output_zip_name(csv_zip_name)
+            st.download_button(
+                label=f"Download {out_name}",
+                data=out_bytes,
+                file_name=out_name,
+                mime="application/zip",
+            )
         except zipfile.BadZipFile:
-            st.error("The audio source does not appear to be a valid zip archive.")
+            st.error("The source zip does not appear to be a valid zip archive.")
+
+    else:
+        # CSV-only or Audio-only path: separate download buttons
+        out_csv_bytes = build_output_zip(consolidated_bio, consolidated_subs)
+        out_csv_name  = output_zip_name(csv_zip_name)
+        st.download_button(
+            label=f"Download {out_csv_name}",
+            data=out_csv_bytes,
+            file_name=out_csv_name,
+            mime="application/zip",
+        )
+
+        if audio_zip_bytes is not None:
+            try:
+                if not zipfile.is_zipfile(io.BytesIO(audio_zip_bytes)):
+                    st.error("The audio source does not appear to be a valid zip archive.")
+                else:
+                    with st.spinner("Consolidating audio files…"):
+                        out_audio_bytes, missing_audio = build_output_audio_zip(
+                            audio_zip_bytes, consolidated_subs
+                        )
+
+                    if missing_audio:
+                        st.warning(
+                            f"{len(missing_audio)} audio file(s) listed in submissions.csv were not "
+                            f"found in the audio zip and have been omitted from the output:\n"
+                            + "\n".join(f"- {f}" for f in sorted(missing_audio))
+                        )
+
+                    out_audio_name = output_zip_name(audio_zip_name)
+                    st.download_button(
+                        label=f"Download {out_audio_name}",
+                        data=out_audio_bytes,
+                        file_name=out_audio_name,
+                        mime="application/zip",
+                    )
+            except zipfile.BadZipFile:
+                st.error("The audio source does not appear to be a valid zip archive.")
